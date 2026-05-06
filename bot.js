@@ -5,11 +5,8 @@ const fs = require("fs");
 const http = require("http");
 const cron = require("node-cron");
 
-// Мінімальний HTTP сервер щоб Fly.io тримав процес живим
 http.createServer((req, res) => res.end("ok")).listen(8080);
 
-// --- Конфіг ---
-// На сервері (Fly.io) читаємо з process.env, локально — з .env файлу
 function getEnv(key) {
   if (process.env[key]) return process.env[key];
   try {
@@ -22,9 +19,9 @@ function getEnv(key) {
 
 const SHEET_ID = "1IxUy27QcUZxBfTHpNmdH1fSKqvXDfszxEeY5VHE5CTk";
 const bot = new TelegramBot(getEnv("TELEGRAM_TOKEN"), { polling: true });
-const client = new Anthropic({ apiKey: getEnv("ANTHROPIC_API_KEY") });
+const claude = new Anthropic({ apiKey: getEnv("ANTHROPIC_API_KEY") });
 
-console.log("🤖 Бот запущено. Чекаю команди...");
+console.log("🤖 Funnel Bot запущено...");
 
 // --- Читаємо Google Sheets ---
 async function getSheetData() {
@@ -52,76 +49,102 @@ async function getSheetData() {
   });
 }
 
-// --- Рахуємо метрики ---
+// --- Рахуємо метрики (з захистом від ділення на 0) ---
 function calcMetrics(campaigns) {
   return campaigns.map((c) => ({
     campaign: c.campaign,
     channel: c.channel,
     spend: c.spend,
-    ctr: ((c.clicks / c.impressions) * 100).toFixed(2),
-    cac: (c.spend / c.conversions).toFixed(2),
-    romi: (((c.revenue - c.spend) / c.spend) * 100).toFixed(0),
     revenue: c.revenue,
+    ctr: c.impressions > 0 ? ((c.clicks / c.impressions) * 100).toFixed(2) : "—",
+    cpc: c.clicks > 0 ? (c.spend / c.clicks).toFixed(2) : "—",
+    cac: c.conversions > 0 ? (c.spend / c.conversions).toFixed(2) : "—",
+    romi: c.spend > 0 ? (((c.revenue - c.spend) / c.spend) * 100).toFixed(0) : "—",
   }));
 }
 
-// --- AI висновок ---
+// --- AI: загальний висновок ---
 async function getAIInsights(metrics) {
   const dataText = metrics
-    .map((m) => `${m.campaign} (${m.channel}): витрати $${m.spend}, CTR ${m.ctr}%, CAC $${m.cac}, ROMI ${m.romi}%, виручка $${m.revenue}`)
+    .map((m) => `${m.campaign} (${m.channel}): витрати $${m.spend}, CTR ${m.ctr}%, CPC $${m.cpc}, CAC $${m.cac}, ROMI ${m.romi}%, дохід $${m.revenue}`)
     .join("\n");
-  const response = await client.messages.create({
+
+  const res = await claude.messages.create({
     model: "claude-haiku-4-5-20251001",
-    max_tokens: 250,
+    max_tokens: 400,
     messages: [{
       role: "user",
-      content: `Ти маркетинг-аналітик. Дані:\n\n${dataText}\n\nДай висновок у 2-3 реченнях: що працює, що вимкнути, одна рекомендація. Українською, коротко.`,
+      content: `Ти маркетинг-аналітик. Дані по кампаніях:\n\n${dataText}\n\nДай висновок у 3-4 реченнях: що працює найкраще, що вимкнути, одна конкретна рекомендація. Українською, коротко.`,
     }],
   });
-  return response.content[0].text;
+  return res.content[0].text;
 }
 
-// --- /звіт — повний звіт ---
+// --- AI: рекомендації по бюджету ---
+async function getAIBudget(metrics) {
+  const dataText = metrics
+    .map((m) => `${m.campaign} (${m.channel}): витрати $${m.spend}, CTR ${m.ctr}%, CPC $${m.cpc}, CAC $${m.cac}, ROMI ${m.romi}%, дохід $${m.revenue}`)
+    .join("\n");
+
+  const res = await claude.messages.create({
+    model: "claude-haiku-4-5-20251001",
+    max_tokens: 500,
+    messages: [{
+      role: "user",
+      content: `Ти маркетинг-аналітик. Дані по кампаніях:\n\n${dataText}\n\nДай конкретні рекомендації по бюджету:\n- Які канали масштабувати і на скільки %\n- Які канали скоротити або вимкнути\n- Куди перекинути вивільнений бюджет\nУкраїнською, по кожному каналу окремо.`,
+    }],
+  });
+  return res.content[0].text;
+}
+
+// --- /zvit — повний звіт ---
 async function handleZvit(chatId) {
   await bot.sendMessage(chatId, "⏳ Читаю дані з Google Sheets...");
   const campaigns = await getSheetData();
   const metrics = calcMetrics(campaigns);
   const aiText = await getAIInsights(metrics);
   const sorted = [...metrics].sort((a, b) => b.romi - a.romi);
+  const date = new Date().toLocaleDateString("uk-UA");
 
-  let msg = "📊 <b>Повний звіт по воронці</b>\n";
-  msg += `🗓 ${new Date().toLocaleDateString("uk-UA")}\n\n`;
+  let msg = `📊 <b>Повний звіт по воронці</b>\n🗓 ${date}\n\n`;
   sorted.forEach((m) => {
-    const emoji = m.romi > 200 ? "🟢" : m.romi > 0 ? "🟡" : "🔴";
+    const romiNum = parseFloat(m.romi);
+    const emoji = isNaN(romiNum) ? "⚪" : romiNum > 200 ? "🟢" : romiNum > 0 ? "🟡" : "🔴";
     msg += `${emoji} <b>${m.campaign}</b> (${m.channel})\n`;
-    msg += `   Витрати: $${m.spend} | ROMI: ${m.romi}% | CAC: $${m.cac}\n`;
+    msg += `   Витрати: $${m.spend}  |  Дохід: $${m.revenue}\n`;
+    msg += `   CTR: ${m.ctr}%  |  CPC: $${m.cpc}  |  CAC: $${m.cac}  |  ROMI: ${m.romi}%\n\n`;
   });
-  msg += `\n🤖 <b>AI-висновок:</b>\n${aiText}`;
+  msg += `🤖 <b>AI-висновок:</b>\n${aiText}`;
+
   await bot.sendMessage(chatId, msg, { parse_mode: "HTML" });
 }
 
-// --- /топ — топ 3 кампанії за ROMI ---
+// --- /top — топ-3 кампанії за ROMI ---
 async function handleTop(chatId) {
   await bot.sendMessage(chatId, "⏳ Шукаю найкращі кампанії...");
   const campaigns = await getSheetData();
   const metrics = calcMetrics(campaigns);
-  const top3 = [...metrics].sort((a, b) => b.romi - a.romi).slice(0, 3);
+  const top3 = [...metrics]
+    .filter((m) => m.romi !== "—")
+    .sort((a, b) => b.romi - a.romi)
+    .slice(0, 3);
 
   let msg = "🏆 <b>Топ-3 кампанії за ROMI</b>\n\n";
   top3.forEach((m, i) => {
     const medals = ["🥇", "🥈", "🥉"];
-    msg += `${medals[i]} <b>${m.campaign}</b>\n`;
-    msg += `   Канал: ${m.channel} | ROMI: ${m.romi}% | CAC: $${m.cac} | Виручка: $${m.revenue}\n\n`;
+    msg += `${medals[i]} <b>${m.campaign}</b> (${m.channel})\n`;
+    msg += `   ROMI: ${m.romi}%  |  CAC: $${m.cac}  |  CTR: ${m.ctr}%\n`;
+    msg += `   Витрати: $${m.spend}  |  Дохід: $${m.revenue}\n\n`;
   });
   await bot.sendMessage(chatId, msg, { parse_mode: "HTML" });
 }
 
-// --- /стоп — збиткові кампанії ---
+// --- /stop — збиткові кампанії ---
 async function handleStop(chatId) {
   await bot.sendMessage(chatId, "⏳ Перевіряю збиткові кампанії...");
   const campaigns = await getSheetData();
   const metrics = calcMetrics(campaigns);
-  const losers = metrics.filter((m) => m.romi < 0);
+  const losers = metrics.filter((m) => m.romi !== "—" && parseFloat(m.romi) < 0);
 
   if (losers.length === 0) {
     await bot.sendMessage(chatId, "✅ Збиткових кампаній немає. Все в плюсі!");
@@ -130,42 +153,91 @@ async function handleStop(chatId) {
 
   let msg = "🛑 <b>Кампанії які треба вимкнути (ROMI &lt; 0%)</b>\n\n";
   losers.forEach((m) => {
+    const loss = (m.spend - m.revenue).toFixed(0);
     msg += `❌ <b>${m.campaign}</b> (${m.channel})\n`;
-    msg += `   Витрати: $${m.spend} | ROMI: ${m.romi}% | Збиток: $${m.spend - m.revenue}\n\n`;
+    msg += `   Витрати: $${m.spend}  |  ROMI: ${m.romi}%  |  Збиток: $${loss}\n\n`;
   });
   await bot.sendMessage(chatId, msg, { parse_mode: "HTML" });
 }
 
-// --- Обробник команд ---
-bot.onText(/\/zvit/, async (msg) => {
+// --- /budget — рекомендації по бюджету ---
+async function handleBudget(chatId) {
+  await bot.sendMessage(chatId, "⏳ Аналізую розподіл бюджету...");
+  const campaigns = await getSheetData();
+  const metrics = calcMetrics(campaigns);
+  const aiText = await getAIBudget(metrics);
+  const date = new Date().toLocaleDateString("uk-UA");
+
+  const msg = `💰 <b>Рекомендації по бюджету</b>\n🗓 ${date}\n\n${aiText}`;
+  await bot.sendMessage(chatId, msg, { parse_mode: "HTML" });
+}
+
+// --- Меню ---
+const menuKeyboard = {
+  reply_markup: {
+    keyboard: [
+      [{ text: "📊 Повний звіт" }, { text: "🏆 Топ кампанії" }],
+      [{ text: "🛑 Збиткові" }, { text: "💰 Бюджет" }],
+    ],
+    resize_keyboard: true,
+  },
+};
+
+// --- Команди ---
+bot.onText(/^\/zvit(@\w+)?$/, async (msg) => {
   try { await handleZvit(msg.chat.id); }
   catch (e) { await bot.sendMessage(msg.chat.id, "❌ Помилка: " + e.message); }
 });
 
-bot.onText(/\/top/, async (msg) => {
+bot.onText(/^\/top(@\w+)?$/, async (msg) => {
   try { await handleTop(msg.chat.id); }
   catch (e) { await bot.sendMessage(msg.chat.id, "❌ Помилка: " + e.message); }
 });
 
-bot.onText(/\/stop/, async (msg) => {
+bot.onText(/^\/stop(@\w+)?$/, async (msg) => {
   try { await handleStop(msg.chat.id); }
   catch (e) { await bot.sendMessage(msg.chat.id, "❌ Помилка: " + e.message); }
 });
 
-bot.onText(/\/start/, async (msg) => {
-  const help = `👋 Привіт! Я аналізую рекламні кампанії.
-
-Команди:
-/zvit — повний звіт по всіх кампаніях
-/top — топ-3 кампанії за ROMI
-/stop — збиткові кампанії які треба вимкнути`;
-  await bot.sendMessage(msg.chat.id, help);
+bot.onText(/^\/budget(@\w+)?$/, async (msg) => {
+  try { await handleBudget(msg.chat.id); }
+  catch (e) { await bot.sendMessage(msg.chat.id, "❌ Помилка: " + e.message); }
 });
 
-// --- Автозвіт щодня о 9:00 за Києвом (UTC+3 = 06:00 UTC) ---
+bot.onText(/^\/menu(@\w+)?$/, async (msg) => {
+  await bot.sendMessage(msg.chat.id, "Оберіть дію:", menuKeyboard);
+});
+
+bot.onText(/^\/start(@\w+)?$/, async (msg) => {
+  await bot.sendMessage(
+    msg.chat.id,
+    `👋 Funnel Bot активний!\n\n` +
+    `/zvit — повний звіт по всіх кампаніях\n` +
+    `/top — топ-3 кампанії за ROMI\n` +
+    `/stop — збиткові кампанії\n` +
+    `/budget — рекомендації по бюджету\n` +
+    `/menu — відкрити меню`,
+    menuKeyboard
+  );
+});
+
+// --- Обробка кнопок меню ---
+bot.on("message", async (msg) => {
+  if (!msg.text || msg.text.startsWith("/")) return;
+  try {
+    if (msg.text === "📊 Повний звіт") await handleZvit(msg.chat.id);
+    else if (msg.text === "🏆 Топ кампанії") await handleTop(msg.chat.id);
+    else if (msg.text === "🛑 Збиткові") await handleStop(msg.chat.id);
+    else if (msg.text === "💰 Бюджет") await handleBudget(msg.chat.id);
+  } catch (e) {
+    await bot.sendMessage(msg.chat.id, "❌ Помилка: " + e.message);
+  }
+});
+
+// --- Автозвіт щодня о 9:00 Київ (06:00 UTC) ---
 cron.schedule("0 6 * * *", async () => {
   try {
-    console.log("Автозвіт: відправляю щоденний звіт...");
+    console.log("Автозвіт: відправляю...");
     await handleZvit(getEnv("TELEGRAM_CHAT_ID"));
   } catch (e) {
     console.error("Автозвіт помилка:", e.message);
