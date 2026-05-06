@@ -2,10 +2,23 @@ const Anthropic = require("@anthropic-ai/sdk");
 const TelegramBot = require("node-telegram-bot-api");
 const { google } = require("googleapis");
 const fs = require("fs");
+const http = require("http");
+const cron = require("node-cron");
+
+// Мінімальний HTTP сервер щоб Fly.io тримав процес живим
+http.createServer((req, res) => res.end("ok")).listen(8080);
 
 // --- Конфіг ---
-const env = fs.readFileSync(".env", "utf8");
-const getEnv = (key) => env.match(new RegExp(key + "=(.+)"))[1].trim();
+// На сервері (Fly.io) читаємо з process.env, локально — з .env файлу
+function getEnv(key) {
+  if (process.env[key]) return process.env[key];
+  try {
+    const env = fs.readFileSync(".env", "utf8");
+    return env.match(new RegExp(key + "=(.+)"))[1].trim();
+  } catch {
+    throw new Error(`Змінна ${key} не знайдена`);
+  }
+}
 
 const SHEET_ID = "1IxUy27QcUZxBfTHpNmdH1fSKqvXDfszxEeY5VHE5CTk";
 const bot = new TelegramBot(getEnv("TELEGRAM_TOKEN"), { polling: true });
@@ -15,8 +28,12 @@ console.log("🤖 Бот запущено. Чекаю команди...");
 
 // --- Читаємо Google Sheets ---
 async function getSheetData() {
+  const keyJson = process.env.GOOGLE_KEY_JSON
+    ? JSON.parse(Buffer.from(process.env.GOOGLE_KEY_JSON, "base64").toString())
+    : JSON.parse(fs.readFileSync("google-key.json", "utf8"));
+
   const auth = new google.auth.GoogleAuth({
-    keyFile: "google-key.json",
+    credentials: keyJson,
     scopes: ["https://www.googleapis.com/auth/spreadsheets.readonly"],
   });
   const sheets = google.sheets({ version: "v4", auth });
@@ -111,7 +128,7 @@ async function handleStop(chatId) {
     return;
   }
 
-  let msg = "🛑 <b>Кампанії які треба вимкнути (ROMI < 0%)</b>\n\n";
+  let msg = "🛑 <b>Кампанії які треба вимкнути (ROMI &lt; 0%)</b>\n\n";
   losers.forEach((m) => {
     msg += `❌ <b>${m.campaign}</b> (${m.channel})\n`;
     msg += `   Витрати: $${m.spend} | ROMI: ${m.romi}% | Збиток: $${m.spend - m.revenue}\n\n`;
@@ -120,27 +137,37 @@ async function handleStop(chatId) {
 }
 
 // --- Обробник команд ---
-bot.onText(/\/звіт/, async (msg) => {
+bot.onText(/\/zvit/, async (msg) => {
   try { await handleZvit(msg.chat.id); }
   catch (e) { await bot.sendMessage(msg.chat.id, "❌ Помилка: " + e.message); }
 });
 
-bot.onText(/\/топ/, async (msg) => {
+bot.onText(/\/top/, async (msg) => {
   try { await handleTop(msg.chat.id); }
   catch (e) { await bot.sendMessage(msg.chat.id, "❌ Помилка: " + e.message); }
 });
 
-bot.onText(/\/стоп/, async (msg) => {
+bot.onText(/\/stop/, async (msg) => {
   try { await handleStop(msg.chat.id); }
   catch (e) { await bot.sendMessage(msg.chat.id, "❌ Помилка: " + e.message); }
 });
 
-bot.onText(/\/старт|\/start/, async (msg) => {
+bot.onText(/\/start/, async (msg) => {
   const help = `👋 Привіт! Я аналізую рекламні кампанії.
 
 Команди:
-/звіт — повний звіт по всіх кампаніях
-/топ — топ-3 кампанії за ROMI
-/стоп — збиткові кампанії які треба вимкнути`;
+/zvit — повний звіт по всіх кампаніях
+/top — топ-3 кампанії за ROMI
+/stop — збиткові кампанії які треба вимкнути`;
   await bot.sendMessage(msg.chat.id, help);
 });
+
+// --- Автозвіт щодня о 9:00 за Києвом (UTC+3 = 06:00 UTC) ---
+cron.schedule("0 6 * * *", async () => {
+  try {
+    console.log("Автозвіт: відправляю щоденний звіт...");
+    await handleZvit(getEnv("TELEGRAM_CHAT_ID"));
+  } catch (e) {
+    console.error("Автозвіт помилка:", e.message);
+  }
+}, { timezone: "UTC" });
